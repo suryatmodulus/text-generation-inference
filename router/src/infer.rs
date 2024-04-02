@@ -1,12 +1,15 @@
 /// Batching and inference logic
 use crate::validation::{Validation, ValidationError};
 use crate::{
-    ChatTemplateInputs, Entry, GenerateRequest, GenerateStreamResponse, HubTokenizerConfig,
-    Message, PrefillToken, Queue, Token,
+    ChatTemplateInputs, Entry, FunctionsMap, GenerateRequest, GenerateStreamResponse,
+    HubTokenizerConfig, Message, PrefillToken, Properties, Queue, Token, Tool,
 };
+use crate::{FunctionRef, ToolType, Tools};
 use futures::future::try_join_all;
 use minijinja::{Environment, ErrorKind, Template};
 use nohash_hasher::IntMap;
+use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -339,6 +342,120 @@ impl ChatTemplate {
                 add_generation_prompt: true,
             })
             .map_err(InferError::TemplateError)
+    }
+}
+
+pub struct ToolGrammar;
+
+impl ToolGrammar {
+    pub fn apply(
+        tools: Option<&Vec<Tool>>,
+        tool_choice: Option<&ToolType>,
+    ) -> Result<Option<Tools>, InferError> {
+        match (tools, tool_choice) {
+            (Some(req_tools), Some(tool_choice)) => {
+                let tools_to_use = match tool_choice {
+                    ToolType::FunctionName(name) => {
+                        vec![req_tools
+                            .iter()
+                            .find(|tool| tool.function.name == *name)
+                            .ok_or_else(|| InferError::ToolError("Tool not found".to_string()))?
+                            .clone()]
+                    }
+                    ToolType::OneOf => req_tools.to_owned(),
+                };
+
+                let mut functions: HashMap<String, Value> = tools_to_use
+                    .iter()
+                    .map(|tool| {
+                        let func = tool.function.clone();
+
+                        // Clone the existing parameters, which are expected to be a JSON object
+                        let mut params = if let Value::Object(params) = &func.arguments {
+                            params.clone()
+                        } else {
+                            serde_json::Map::new()
+                        };
+
+                        // Insert the function's description at the top level, outside of properties
+                        params.insert(
+                            "description".to_string(),
+                            Value::String(func.description.clone().unwrap_or_default()),
+                        );
+
+                        // Ensure 'properties' exists and is an object
+                        let properties = params
+                            .entry("properties".to_string())
+                            .or_insert_with(|| json!({}))
+                            .as_object_mut()
+                            .unwrap();
+
+                        // Insert the constant for the function name inside 'properties'
+                        properties.insert(
+                            "_name".to_string(),
+                            json!({
+                                "type": "string",
+                                "const": func.name.clone(),
+                                "description": "The name of the function"
+                            }),
+                        );
+
+                        // Check if 'required' exists, and it is an array. If not, create an empty array.
+                        let required = params
+                            .entry("required".to_string())
+                            .or_insert_with(|| json!([]))
+                            .as_array_mut()
+                            .unwrap();
+
+                        // Add 'name' to the 'required' array if it is not already present
+                        if !required.iter().any(|r| r == "_name") {
+                            required.push(json!("_name"));
+                        }
+
+                        (func.name, Value::Object(params))
+                    })
+                    .collect();
+
+                // adds the error notification function for LLM feedback if required
+                let mut text_response_properties = serde_json::Map::new();
+                text_response_properties.insert(
+                    "error".to_string(),
+                    json!({
+                        "type": "string",
+                        "description": "The error or issue to notify"
+                    }),
+                );
+                text_response_properties.insert(
+                    "name".to_string(),
+                    json!({
+                        "type": "string",
+                        "description": "The name of the function",
+                        "const": "notify_error"
+                    }),
+                );
+                let text_response_object = json!({
+                    "description": "Useful to notify when a tool can not be called.",
+                    "properties": text_response_properties,
+                    "required": ["error", "name"],
+                    "type": "object"
+                });
+                functions.insert("notify_error".to_string(), text_response_object);
+
+                let tools = Tools {
+                    functions_map: FunctionsMap { functions },
+                    properties: Properties {
+                        function: tools_to_use
+                            .iter()
+                            .map(|tool| FunctionRef {
+                                ref_path: format!("#/$functions/{}", tool.function.name.clone()),
+                            })
+                            .collect(),
+                    },
+                };
+                Ok(Some(tools))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
@@ -757,6 +874,8 @@ pub enum InferError {
     IncompleteGeneration,
     #[error("Template error: {0}")]
     TemplateError(#[from] minijinja::Error),
+    #[error("Tool error: {0}")]
+    ToolError(String),
 }
 
 impl InferError {
@@ -767,6 +886,7 @@ impl InferError {
             InferError::ValidationError(_) => "validation",
             InferError::IncompleteGeneration => "incomplete_generation",
             InferError::TemplateError(_) => "template_error",
+            InferError::ToolError(_) => "tool_error",
         }
     }
 }
@@ -775,9 +895,14 @@ impl InferError {
 #[cfg(test)]
 mod tests {
     use crate::infer::raise_exception;
+    use crate::infer::ToolGrammar;
     use crate::ChatTemplateInputs;
+    use crate::FunctionDefinition;
     use crate::Message;
+    use crate::Tool;
+    use crate::ToolType;
     use minijinja::Environment;
+    use serde_json::json;
 
     #[test]
     fn test_chat_template() {
@@ -1467,5 +1592,118 @@ mod tests {
             let result = tmpl.unwrap().render(input).unwrap();
             assert_eq!(result, target);
         }
+    }
+
+    #[test]
+    fn test_apply_with_none() {
+        let result = ToolGrammar::apply(None, None).expect("Failed to apply grammar");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_apply_with_tools_none() {
+        let result =
+            ToolGrammar::apply(None, Some(&ToolType::OneOf)).expect("Failed to apply grammar");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_apply_with_choice_none() {
+        let tools = Some(vec![Tool {
+            r#type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "test".to_string(),
+                description: Some("A test function".to_string()),
+                arguments: json!({}),
+            },
+        }]);
+        let result = ToolGrammar::apply(tools.as_ref(), None).expect("Failed to apply grammar");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_apply_with_tool_not_found() {
+        let tools = Some(vec![Tool {
+            r#type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "test".to_string(),
+                description: Some("A test function".to_string()),
+                arguments: json!({}),
+            },
+        }]);
+        let result = ToolGrammar::apply(
+            tools.as_ref(),
+            Some(&ToolType::FunctionName("nonexistent".to_string())),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Tool error: Tool not found"
+        );
+    }
+
+    #[test]
+    fn test_apply_with_tool_found() {
+        let tools = Some(vec![Tool {
+            r#type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "test".to_string(),
+                description: Some("A test function".to_string()),
+                arguments: json!({}),
+            },
+        }]);
+        let result = ToolGrammar::apply(
+            tools.as_ref(),
+            Some(&ToolType::FunctionName("test".to_string())),
+        )
+        .expect("Failed to apply grammar");
+        let expected = json!({
+          "$functions": {
+            "notify_error": {
+              "description": "Useful to notify when a tool can not be called.",
+              "properties": {
+                "error": {
+                  "description": "The error or issue to notify",
+                  "type": "string"
+                },
+                "name": {
+                  "const": "notify_error",
+                  "description": "The name of the function",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "error",
+                "name"
+              ],
+              "type": "object"
+            },
+            "test": {
+              "description": "A test function",
+              "properties": {
+                "_name": {
+                  "const": "test",
+                  "description": "The name of the function",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "_name"
+              ]
+            }
+          },
+          "properties": {
+            "function": {
+              "anyOf": [
+                {
+                  "$ref": "#/$functions/test"
+                }
+              ]
+            }
+          }
+        });
+        assert_eq!(
+            serde_json::to_value(result).expect("Failed to serialize"),
+            expected
+        );
     }
 }
